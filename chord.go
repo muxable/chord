@@ -4,8 +4,12 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"io/ioutil"
+	"log"
 	"net/http"
 	"strconv"
+	"strings"
+	"time"
 )
 
 const M = 64
@@ -22,21 +26,39 @@ type Node interface {
 }
 
 type LocalNode struct {
+	ctx         context.Context
 	id          uint64
 	host        string
 	finger      [M]Node
 	next        uint16
 	predecessor Node
-	successor   Node
-	cancel      context.CancelFunc
 }
 
 var _ Node = (*LocalNode)(nil)
 
 func NewLocalNode(ctx context.Context, id uint64, host string) *LocalNode {
-	n := &LocalNode{id: id, host: host}
+	n := &LocalNode{ctx: ctx, id: id, host: host}
 	go func() {
-		
+		stabilize := time.NewTicker(1 * time.Second)
+		fixFingers := time.NewTicker(100 * time.Millisecond)
+		checkPredecessor := time.NewTicker(10 * time.Second)
+		for {
+			select {
+			case <-n.ctx.Done():
+				stabilize.Stop()
+				return
+			case <-stabilize.C:
+				if err := n.Stabilize(); err != nil {
+					log.Printf("got error %v", err)
+				}
+			case <-fixFingers.C:
+				if err := n.FixFingers(); err != nil {
+					log.Printf("got error %v", err)
+				}
+			case <-checkPredecessor.C:
+				n.CheckPredecessor()
+			}
+		}
 	}()
 	return n
 }
@@ -50,10 +72,10 @@ func (n *LocalNode) Host() string {
 }
 
 func (n *LocalNode) Successor() (Node, error) {
-	if n.successor == nil {
+	if n.finger[0] == nil {
 		return n, nil
 	}
-	return n.successor, nil
+	return n.finger[0], nil
 }
 
 func (n *LocalNode) Predecessor() (Node, error) {
@@ -61,7 +83,10 @@ func (n *LocalNode) Predecessor() (Node, error) {
 }
 
 func (n *LocalNode) FindSuccessor(id uint64) (Node, error) {
-	successor := n.successor
+	successor, err := n.Successor()
+	if err != nil {
+		return nil, err
+	}
 	if id > n.ID() && id < successor.ID() {
 		return successor, nil
 	} else {
@@ -70,12 +95,18 @@ func (n *LocalNode) FindSuccessor(id uint64) (Node, error) {
 		if err != nil {
 			return nil, err
 		}
+		if n0 == n {
+			return n, nil
+		}
 		return n0.FindSuccessor(id)
 	}
 }
 
 func (n *LocalNode) ClosestPrecedingNode(id uint64) (Node, error) {
-	for i := M; i >= 1; i-- {
+	for i := M - 1; i >= 0; i-- {
+		if n.finger[i] == nil {
+			continue
+		}
 		if n.ID() < n.finger[i].ID() && n.finger[i].ID() < id {
 			return n.finger[i], nil
 		}
@@ -89,8 +120,8 @@ func (n *LocalNode) Join(m Node) error {
 		return err
 	}
 	n.predecessor = nil
-	n.successor = s
-	return nil
+	n.finger[0] = s
+	return s.Notify(n)
 }
 
 func (n *LocalNode) Stabilize() error {
@@ -102,8 +133,11 @@ func (n *LocalNode) Stabilize() error {
 	if err != nil {
 		return err
 	}
+	if x == nil {
+		return nil
+	}
 	if n.ID() < x.ID() && x.ID() < successor.ID() {
-		n.successor = x
+		n.finger[0] = x
 	}
 	return successor.Notify(n)
 }
@@ -142,9 +176,21 @@ func (n *LocalNode) HTTPHandlerFunc() http.HandlerFunc {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Query().Get("op") {
 		case "Successor":
-			w.Write([]byte(n.successor.Serialize()))
+			successor, err := n.Successor()
+			if err != nil {
+				w.WriteHeader(500)
+			} else {
+				w.Write([]byte(successor.Serialize()))
+			}
 		case "Predecessor":
-			w.Write([]byte(n.successor.Serialize()))
+			predecessor, err := n.Predecessor()
+			if err != nil {
+				w.WriteHeader(500)
+			} else if predecessor == nil {
+				w.WriteHeader(200)
+			} else {
+				w.Write([]byte(predecessor.Serialize()))
+			}
 		case "FindSuccessor":
 			id, err := strconv.ParseUint(r.URL.Query().Get("id"), 16, 64)
 			if err != nil {
@@ -187,7 +233,11 @@ func (n *LocalNode) HTTPHandlerFunc() http.HandlerFunc {
 }
 
 func (n *LocalNode) Serialize() string {
-	return fmt.Sprintf("%x%s", n.id, n.host)
+	return fmt.Sprintf("%x:%s", n.id, n.host)
+}
+
+func (n *LocalNode) String() string {
+	return fmt.Sprintf("local[%s]", n.Serialize())
 }
 
 type RemoteNode struct {
@@ -196,6 +246,20 @@ type RemoteNode struct {
 }
 
 var _ Node = (*RemoteNode)(nil)
+
+func NewRemoteNode(addr string) (*RemoteNode, error) {
+	// resolve the id automatically.
+	resp, err := http.Get(fmt.Sprintf("http://%s/node", addr))
+	if err != nil {
+		return nil, err
+	}
+	body, err := ioutil.ReadAll(resp.Body)
+	if err != nil {
+		return nil, err
+	}
+	n := &RemoteNode{}
+	return n, n.Deserialize(string(body))
+}
 
 func (n *RemoteNode) ID() uint64 {
 	return n.id
@@ -206,7 +270,7 @@ func (n *RemoteNode) Host() string {
 }
 
 func (n *RemoteNode) op(name string, arg string) (Node, error) {
-	url := fmt.Sprintf("http://%s?op=%s", n.host, name)
+	url := fmt.Sprintf("http://%s/node?op=%s", n.host, name)
 	if arg != "" {
 		url += fmt.Sprintf("&%s", arg)
 	}
@@ -239,23 +303,28 @@ func (n *RemoteNode) ClosestPrecedingNode(id uint64) (Node, error) {
 }
 
 func (n *RemoteNode) Notify(m Node) error {
-	_, err := n.op("ClosestPrecedingNode", fmt.Sprintf("id=%x&host=%s", m.ID(), m.Host()))
+	_, err := n.op("Notify", fmt.Sprintf("id=%x&host=%s", m.ID(), m.Host()))
 	return err
 }
 
 func (n *RemoteNode) Serialize() string {
-	return fmt.Sprintf("%x%s", n.id, n.host)
+	return fmt.Sprintf("%x:%s", n.id, n.host)
 }
 
 func (n *RemoteNode) Deserialize(s string) error {
 	if len(s) < 16 {
 		return nil
 	}
-	id, err := strconv.ParseUint(s[:16], 16, 64)
+	tokens := strings.SplitN(s, ":", 2)
+	id, err := strconv.ParseUint(tokens[0], 16, 64)
 	if err != nil {
 		return err
 	}
 	n.id = id
-	n.host = string(s[16:])
+	n.host = tokens[1]
 	return nil
+}
+
+func (n *RemoteNode) String() string {
+	return fmt.Sprintf("remote[%s]", n.Serialize())
 }

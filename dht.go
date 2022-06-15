@@ -4,10 +4,8 @@ import (
 	"bytes"
 	"fmt"
 	"io"
-	"net"
 	"net/http"
 	"strconv"
-	"strings"
 )
 
 type DHTServer struct {
@@ -32,7 +30,7 @@ func (s *DHTServer) Get(key uint64) ([]byte, error) {
 	return io.ReadAll(resp.Body)
 }
 
-func (s *DHTServer) Put(key uint64, value []byte) error {
+func (s *DHTServer) Set(key uint64, value []byte) error {
 	node, err := s.node.FindSuccessor(key)
 	if err != nil {
 		return err
@@ -41,41 +39,30 @@ func (s *DHTServer) Put(key uint64, value []byte) error {
 	return err
 }
 
-func (s *DHTServer) Serve(lis net.Listener) error {
+func (s *DHTServer) HTTPServeMux() *http.ServeMux {
 	mux := http.NewServeMux()
 	mux.Handle("/node", s.node.HTTPHandlerFunc())
 	mux.Handle("/store", http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
-		tokens := strings.Split(req.URL.Path, "/")
-		if len(tokens) < 2 {
-			w.WriteHeader(404)
-			return
-		}
-		key, err := strconv.ParseUint(tokens[2], 16, 64)
+		setValue := req.URL.Query().Get("value")
+		key, err := strconv.ParseUint(req.URL.Query().Get("key"), 16, 64)
 		if err != nil {
 			w.WriteHeader(404)
 			return
 		}
-		if req.Method == "GET" {
-			value, err := s.store.Get(key)
+		if setValue == "" {
+			value, err := s.Get(key)
 			if err != nil {
 				w.WriteHeader(500)
 				return
 			}
 			w.Write(value)
-		} else if req.Method == "POST" {
-			body, err := io.ReadAll(req.Body)
-			if err != nil {
-				w.WriteHeader(500)
-				return
-			}
-			if err := s.store.Set(key, body); err != nil {
+		} else {
+			if err := s.Set(key, []byte(setValue)); err != nil {
 				w.WriteHeader(500)
 			} else {
 				w.Write([]byte{})
 			}
-		} else {
-			w.WriteHeader(400)
 		}
 	}))
-	return http.Serve(lis, mux)
+	return mux
 }
