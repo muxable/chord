@@ -14,13 +14,21 @@ import (
 
 const M = 64
 
+const R = 32
+
+func between(n1, n2, n3 uint64) bool {
+	if n1 < n3 {
+		return n1 < n2 && n2 < n3
+	}
+	return n1 < n2 || n2 < n3
+}
+
 type Node interface {
 	ID() uint64
 	Host() string
-	Successor() (Node, error)
+	Successors() ([R]Node, error)
 	Predecessor() (Node, error)
 	FindSuccessor(uint64) (Node, error)
-	ClosestPrecedingNode(uint64) (Node, error)
 	Notify(Node) error
 	Serialize() string
 }
@@ -31,6 +39,7 @@ type LocalNode struct {
 	host        string
 	finger      [M]Node
 	next        uint16
+	successors  [R]Node
 	predecessor Node
 }
 
@@ -38,10 +47,13 @@ var _ Node = (*LocalNode)(nil)
 
 func NewLocalNode(ctx context.Context, id uint64, host string) *LocalNode {
 	n := &LocalNode{ctx: ctx, id: id, host: host}
+	for i := 0; i < M; i++ {
+		n.finger[i] = n
+	}
+	n.predecessor = n
 	go func() {
 		stabilize := time.NewTicker(1 * time.Second)
 		fixFingers := time.NewTicker(100 * time.Millisecond)
-		checkPredecessor := time.NewTicker(10 * time.Second)
 		for {
 			select {
 			case <-n.ctx.Done():
@@ -49,14 +61,14 @@ func NewLocalNode(ctx context.Context, id uint64, host string) *LocalNode {
 				return
 			case <-stabilize.C:
 				if err := n.Stabilize(); err != nil {
-					log.Printf("got error %v", err)
+					for i := 0; i < R - 1; i++ {
+						n.successors[i] = n.successors[i + 1]
+					}
 				}
 			case <-fixFingers.C:
 				if err := n.FixFingers(); err != nil {
 					log.Printf("got error %v", err)
 				}
-			case <-checkPredecessor.C:
-				n.CheckPredecessor()
 			}
 		}
 	}()
@@ -71,11 +83,8 @@ func (n *LocalNode) Host() string {
 	return n.host
 }
 
-func (n *LocalNode) Successor() (Node, error) {
-	if n.finger[0] == nil {
-		return n, nil
-	}
-	return n.finger[0], nil
+func (n *LocalNode) Successors() ([R]Node, error) {
+	return n.successors, nil
 }
 
 func (n *LocalNode) Predecessor() (Node, error) {
@@ -83,72 +92,79 @@ func (n *LocalNode) Predecessor() (Node, error) {
 }
 
 func (n *LocalNode) FindSuccessor(id uint64) (Node, error) {
-	successor, err := n.Successor()
+	successors, err := n.Successors()
 	if err != nil {
 		return nil, err
 	}
-	if id > n.ID() && id < successor.ID() {
-		return successor, nil
+	if n.ID() < id && id <= successors[0].ID() {
+		return successors[0], nil
 	} else {
 		// forward the query around the circle.
-		n0, err := n.ClosestPrecedingNode(id)
-		if err != nil {
-			return nil, err
-		}
-		if n0 == n {
-			return n, nil
-		}
-		return n0.FindSuccessor(id)
+		return n.ClosestPrecedingNode(id).FindSuccessor(id)
 	}
 }
 
-func (n *LocalNode) ClosestPrecedingNode(id uint64) (Node, error) {
+func (n *LocalNode) ClosestPrecedingNode(id uint64) Node {
 	for i := M - 1; i >= 0; i-- {
-		if n.finger[i] == nil {
-			continue
-		}
 		if n.ID() < n.finger[i].ID() && n.finger[i].ID() < id {
-			return n.finger[i], nil
+			return n.finger[i]
 		}
 	}
-	return n, nil
+	return n
 }
 
-func (n *LocalNode) Join(m Node) error {
+func (n *LocalNode) Join(m Node) (error) {
+	n.predecessor = nil
 	s, err := m.FindSuccessor(n.id)
 	if err != nil {
 		return err
 	}
-	n.predecessor = nil
-	n.finger[0] = s
-	return s.Notify(n)
+	t, err := s.Successors()
+	if err != nil {
+		return err
+	}
+	n.successors[0] = s
+	if copy(n.successors[1:], t[:(R-1)]) != R-1 {
+		return io.ErrShortWrite
+	}
+	return nil
 }
 
 func (n *LocalNode) Stabilize() error {
-	successor, err := n.Successor()
+	x, err := n.successors[0].Predecessor()
 	if err != nil {
 		return err
 	}
-	x, err := successor.Predecessor()
+	y, err := n.successors[0].Successors()
 	if err != nil {
 		return err
 	}
-	if x == nil {
-		return nil
+	if copy(n.successors[1:], y[:(R-1)]) != R-1 {
+		return io.ErrShortWrite
 	}
-	if n.ID() < x.ID() && x.ID() < successor.ID() {
-		n.finger[0] = x
+	if (between(n.ID(), x.ID(), n.successors[0].ID())) {
+		 z, err := x.Successors()
+		if err != nil {
+			return err
+		}
+		n.successors[0] = x
+		if copy(n.successors[1:], z[:(R-1)]) != R-1 {
+			return io.ErrShortWrite
+		}
 	}
-	return successor.Notify(n)
+	return n.successors[0].Notify(n)
 }
 
 func (n *LocalNode) Notify(m Node) error {
-	predecessor, err := n.Predecessor()
-	if err != nil {
-		return err
-	}
-	if predecessor == nil || (predecessor.ID() < m.ID() && m.ID() < n.ID()) {
+	if n.predecessor == nil {
 		n.predecessor = m
+	} else {
+		switch p := n.predecessor.(type) {
+		case *RemoteNode:
+			if m, err := p.op("", ""); err != nil || m.Host() != n.predecessor.Host() ||  between(n.predecessor.ID(), m.ID(), n.ID()) {
+				n.predecessor = m
+			}
+		}
 	}
 	return nil
 }
@@ -163,24 +179,20 @@ func (n *LocalNode) FixFingers() error {
 	return nil
 }
 
-func (n *LocalNode) CheckPredecessor() {
-	switch p := n.predecessor.(type) {
-	case *RemoteNode:
-		if m, err := p.op("", ""); err != nil || m.Host() != n.predecessor.Host() {
-			n.predecessor = nil
-		}
-	}
-}
-
 func (n *LocalNode) HTTPHandlerFunc() http.HandlerFunc {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Query().Get("op") {
-		case "Successor":
-			successor, err := n.Successor()
+		case "Successors":
+			successors, err := n.Successors()
 			if err != nil {
 				w.WriteHeader(500)
 			} else {
-				w.Write([]byte(successor.Serialize()))
+				for i := 0; i < len(successors); i++ {
+					w.Write([]byte(successors[i].Serialize()))
+					if i != len(successors) - 1 {
+						w.Write([]byte("\n"))
+					}
+				}
 			}
 		case "Predecessor":
 			predecessor, err := n.Predecessor()
@@ -198,18 +210,6 @@ func (n *LocalNode) HTTPHandlerFunc() http.HandlerFunc {
 				return
 			}
 			m, err := n.FindSuccessor(id)
-			if err != nil {
-				w.WriteHeader(400)
-				return
-			}
-			w.Write([]byte(m.Serialize()))
-		case "ClosestPrecedingNode":
-			id, err := strconv.ParseUint(r.URL.Query().Get("id"), 16, 64)
-			if err != nil {
-				w.WriteHeader(400)
-				return
-			}
-			m, err := n.ClosestPrecedingNode(id)
 			if err != nil {
 				w.WriteHeader(400)
 				return
@@ -269,7 +269,7 @@ func (n *RemoteNode) Host() string {
 	return n.host
 }
 
-func (n *RemoteNode) op(name string, arg string) (Node, error) {
+func (n *RemoteNode) op(name string, arg string) ([]string, error) {
 	url := fmt.Sprintf("http://%s/node?op=%s", n.host, name)
 	if arg != "" {
 		url += fmt.Sprintf("&%s", arg)
@@ -282,24 +282,42 @@ func (n *RemoteNode) op(name string, arg string) (Node, error) {
 	if err != nil {
 		return nil, err
 	}
-	m := &RemoteNode{}
-	return m, m.Deserialize(string(body))
+	tokens := strings.Split(string(body), "\n")
+	return tokens, nil
 }
 
-func (n *RemoteNode) Successor() (Node, error) {
-	return n.op("Successor", "")
+func (n *RemoteNode) Successors() ([R]Node, error) {
+	res := [R]Node{}
+	tokens, err := n.op("Successors", "")
+	if err != nil {
+		return res, err
+	}
+	for i := 0; i < R; i++ {
+		m := &RemoteNode{}
+		if err := m.Deserialize(tokens[i]); err != nil {
+			return res, err
+		}
+		res[i] = m
+	}
+	return res, nil
 }
 
 func (n *RemoteNode) Predecessor() (Node, error) {
-	return n.op("Predecessor", "")
+	tokens, err := n.op("Predecessor", "")
+	if err != nil {
+		return nil, err
+	}
+	m := &RemoteNode{}
+	return m, m.Deserialize(tokens[0])
 }
 
 func (n *RemoteNode) FindSuccessor(id uint64) (Node, error) {
-	return n.op("FindSuccessor", fmt.Sprintf("id=%x", id))
-}
-
-func (n *RemoteNode) ClosestPrecedingNode(id uint64) (Node, error) {
-	return n.op("ClosestPrecedingNode", fmt.Sprintf("id=%x", id))
+	tokens, err := n.op("FindSuccessor", "")
+	if err != nil {
+		return nil, err
+	}
+	m := &RemoteNode{}
+	return m, m.Deserialize(tokens[0])
 }
 
 func (n *RemoteNode) Notify(m Node) error {
