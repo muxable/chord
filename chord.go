@@ -2,6 +2,7 @@ package chord
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"io/ioutil"
@@ -14,7 +15,7 @@ import (
 
 const M = 64
 
-const R = 32
+const R = 4 // 32 for production
 
 func between(n1, n2, n3 uint64) bool {
 	if n1 < n3 {
@@ -49,6 +50,9 @@ func NewLocalNode(ctx context.Context, id uint64, host string) *LocalNode {
 	n := &LocalNode{ctx: ctx, id: id, host: host}
 	for i := 0; i < M; i++ {
 		n.finger[i] = n
+	}
+	for i := 0; i < R; i++ {
+		n.successors[i] = n
 	}
 	n.predecessor = n
 	go func() {
@@ -96,7 +100,7 @@ func (n *LocalNode) FindSuccessor(id uint64) (Node, error) {
 	if err != nil {
 		return nil, err
 	}
-	if n.ID() < id && id <= successors[0].ID() {
+	if between(n.ID(), id, successors[0].ID()) || n == successors[0] {
 		return successors[0], nil
 	} else {
 		// forward the query around the circle.
@@ -123,6 +127,7 @@ func (n *LocalNode) Join(m Node) (error) {
 	if err != nil {
 		return err
 	}
+	log.Printf("got successors %v", t)
 	n.successors[0] = s
 	if copy(n.successors[1:], t[:(R-1)]) != R-1 {
 		return io.ErrShortWrite
@@ -161,7 +166,7 @@ func (n *LocalNode) Notify(m Node) error {
 	} else {
 		switch p := n.predecessor.(type) {
 		case *RemoteNode:
-			if m, err := p.op("", ""); err != nil || m.Host() != n.predecessor.Host() ||  between(n.predecessor.ID(), m.ID(), n.ID()) {
+			if _, err := p.op("", ""); err != nil || between(n.predecessor.ID(), m.ID(), n.ID()) {
 				n.predecessor = m
 			}
 		}
@@ -237,7 +242,15 @@ func (n *LocalNode) Serialize() string {
 }
 
 func (n *LocalNode) String() string {
-	return fmt.Sprintf("local[%s]", n.Serialize())
+	ps := "nil"
+	if n.predecessor != nil {
+		ps = n.predecessor.Serialize()
+	}
+	ss := [R]string{}
+	for i := 0; i < R; i++ {
+		ss[i] = n.successors[i].Serialize()
+	}
+	return fmt.Sprintf("local[%s]\npredecessor: %s\nsuccessors: %s", n.Serialize(), ps, ss)
 }
 
 type RemoteNode struct {
@@ -278,6 +291,9 @@ func (n *RemoteNode) op(name string, arg string) ([]string, error) {
 	if err != nil {
 		return nil, err
 	}
+	if resp.StatusCode != 200 {
+		return nil, errors.New(resp.Status)
+	}
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return nil, err
@@ -312,7 +328,7 @@ func (n *RemoteNode) Predecessor() (Node, error) {
 }
 
 func (n *RemoteNode) FindSuccessor(id uint64) (Node, error) {
-	tokens, err := n.op("FindSuccessor", "")
+	tokens, err := n.op("FindSuccessor", fmt.Sprintf("id=%x", id))
 	if err != nil {
 		return nil, err
 	}
