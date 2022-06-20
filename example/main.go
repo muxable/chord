@@ -22,19 +22,28 @@ func main() {
 
 	ctx, cancel := context.WithCancel(context.Background())
 
-	local := chord.NewLocalNode(rand.Uint64(), *addr)
-
+	var remote chord.Node
 	if *join != "" {
-		remote, err := chord.NewRemoteNode(*join)
+		node, err := chord.NewRemoteNode(*join)
 		if err != nil {
 			panic(err)
 		}
-		if err := local.Join(ctx, remote); err != nil {
-			panic(err)
-		}
+		remote = node
 	}
 
-	dht := chord.NewDHTServer(local, &chord.MemoryStore{})
+	local, err := chord.NewLocalNode(rand.Uint64(), *addr, remote)
+	if err != nil {
+		panic(err)
+	}
+
+	dht, err := chord.NewDHTServer(local, &chord.MemoryStore{})
+	if err != nil {
+		panic(err)
+	}
+
+	if *join != "" {
+		go local.Join(ctx)
+	}
 
 	server := &http.Server{Addr: *addr, Handler: dht.HTTPServeMux()}
 
@@ -58,6 +67,11 @@ func main() {
 	// stop accepting incoming requests
 	server.Shutdown(context.Background())
 
-	// forward data
+	// close and forward data
+	if err := server.Close(); err != nil {
+		panic(err)
+	}
+
+	// leave the ring
 	cancel()
 }
