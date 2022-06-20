@@ -22,14 +22,14 @@ func main() {
 
 	ctx, cancel := context.WithCancel(context.Background())
 
-	local := chord.NewLocalNode(ctx, rand.Uint64(), *addr)
+	local := chord.NewLocalNode(rand.Uint64(), *addr)
 
 	if *join != "" {
 		remote, err := chord.NewRemoteNode(*join)
 		if err != nil {
 			panic(err)
 		}
-		if err := local.Join(remote); err != nil {
+		if err := local.Join(ctx, remote); err != nil {
 			panic(err)
 		}
 	}
