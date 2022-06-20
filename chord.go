@@ -10,18 +10,18 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
 const M = 64
-
 const R = 4 // 32 for production
 
 func between(n1, n2, n3 uint64) bool {
 	if n1 < n3 {
-		return n1 < n2 && n2 < n3
+		return n1 < n2 && n2 <= n3
 	}
-	return n1 < n2 || n2 < n3
+	return n1 < n2 || n2 <= n3
 }
 
 type Node interface {
@@ -39,15 +39,15 @@ type LocalNode struct {
 	id          uint64
 	host        string
 	finger      [M]Node
-	next        uint16
 	successors  [R]Node
 	predecessor Node
+	cond *sync.Cond
 }
 
 var _ Node = (*LocalNode)(nil)
 
-func NewLocalNode(ctx context.Context, id uint64, host string) *LocalNode {
-	n := &LocalNode{ctx: ctx, id: id, host: host}
+func NewLocalNode(id uint64, host string) *LocalNode {
+	n := &LocalNode{id: id, host: host, cond: sync.NewCond(&sync.Mutex{})}
 	for i := 0; i < M; i++ {
 		n.finger[i] = n
 	}
@@ -55,27 +55,6 @@ func NewLocalNode(ctx context.Context, id uint64, host string) *LocalNode {
 		n.successors[i] = n
 	}
 	n.predecessor = n
-	go func() {
-		stabilize := time.NewTicker(1 * time.Second)
-		fixFingers := time.NewTicker(100 * time.Millisecond)
-		for {
-			select {
-			case <-n.ctx.Done():
-				stabilize.Stop()
-				return
-			case <-stabilize.C:
-				if err := n.Stabilize(); err != nil {
-					for i := 0; i < R - 1; i++ {
-						n.successors[i] = n.successors[i + 1]
-					}
-				}
-			case <-fixFingers.C:
-				if err := n.FixFingers(); err != nil {
-					log.Printf("got error %v", err)
-				}
-			}
-		}
-	}()
 	return n
 }
 
@@ -100,7 +79,7 @@ func (n *LocalNode) FindSuccessor(id uint64) (Node, error) {
 	if err != nil {
 		return nil, err
 	}
-	if between(n.ID(), id, successors[0].ID()) || n == successors[0] {
+	if between(n.ID(), id, successors[0].ID()) {
 		return successors[0], nil
 	} else {
 		// forward the query around the circle.
@@ -110,14 +89,14 @@ func (n *LocalNode) FindSuccessor(id uint64) (Node, error) {
 
 func (n *LocalNode) ClosestPrecedingNode(id uint64) Node {
 	for i := M - 1; i >= 0; i-- {
-		if n.ID() < n.finger[i].ID() && n.finger[i].ID() < id {
+		if between(n.ID(), n.finger[i].ID(), id) {
 			return n.finger[i]
 		}
 	}
 	return n
 }
 
-func (n *LocalNode) Join(m Node) (error) {
+func (n *LocalNode) Join(ctx context.Context, m Node) error {
 	n.predecessor = nil
 	s, err := m.FindSuccessor(n.id)
 	if err != nil {
@@ -127,12 +106,39 @@ func (n *LocalNode) Join(m Node) (error) {
 	if err != nil {
 		return err
 	}
-	log.Printf("got successors %v", t)
 	n.successors[0] = s
 	if copy(n.successors[1:], t[:(R-1)]) != R-1 {
 		return io.ErrShortWrite
 	}
-	return nil
+	// wait for a confirmation that we've joined successfully
+	n.cond.L.Lock()
+	for n.predecessor == nil {
+		n.cond.Wait()
+	}
+	n.cond.L.Unlock()
+
+	// start stabilization loops
+	stabilize := time.NewTicker(1 * time.Second)
+	fixFingers := time.NewTicker(100 * time.Millisecond)
+	defer stabilize.Stop()
+	defer fixFingers.Stop()
+	for {
+		select {
+		case <-n.ctx.Done():
+			return nil
+		case <-stabilize.C:
+			if err := n.Stabilize(); err != nil {
+				for i := 0; i < R-1; i++ {
+					n.successors[i] = n.successors[i+1]
+				}
+			}
+		case t := <-fixFingers.C:
+			if err := n.FixFingers(t.Nanosecond()); err != nil {
+				// TODO: this error is likely transient, can we remove it?
+				log.Printf("got error %v", err)
+			}
+		}
+	}
 }
 
 func (n *LocalNode) Stabilize() error {
@@ -147,8 +153,8 @@ func (n *LocalNode) Stabilize() error {
 	if copy(n.successors[1:], y[:(R-1)]) != R-1 {
 		return io.ErrShortWrite
 	}
-	if (between(n.ID(), x.ID(), n.successors[0].ID())) {
-		 z, err := x.Successors()
+	if between(n.ID(), x.ID(), n.successors[0].ID()) {
+		z, err := x.Successors()
 		if err != nil {
 			return err
 		}
@@ -161,7 +167,8 @@ func (n *LocalNode) Stabilize() error {
 }
 
 func (n *LocalNode) Notify(m Node) error {
-	if n.predecessor == nil {
+	n.cond.L.Lock()
+	if n.predecessor == nil || n.predecessor == n {
 		n.predecessor = m
 	} else {
 		switch p := n.predecessor.(type) {
@@ -171,16 +178,19 @@ func (n *LocalNode) Notify(m Node) error {
 			}
 		}
 	}
+	n.cond.Broadcast()
+	n.cond.L.Unlock()
 	return nil
 }
 
-func (n *LocalNode) FixFingers() error {
-	s, err := n.FindSuccessor(n.ID() + (1 << n.next))
+func (n *LocalNode) FixFingers(i int) error {
+	s, err := n.FindSuccessor(n.ID() + (1 << (i % M)))
 	if err != nil {
+		// try an earlier finger.
+		n.finger[(i % M)] = n.finger[(i + M - 1) % M]
 		return err
 	}
-	n.finger[n.next] = s
-	n.next = (n.next + 1) % M
+	n.finger[(i % M)] = s
 	return nil
 }
 
@@ -194,7 +204,7 @@ func (n *LocalNode) HTTPHandlerFunc() http.HandlerFunc {
 			} else {
 				for i := 0; i < len(successors); i++ {
 					w.Write([]byte(successors[i].Serialize()))
-					if i != len(successors) - 1 {
+					if i != len(successors)-1 {
 						w.Write([]byte("\n"))
 					}
 				}
