@@ -31,7 +31,7 @@ func main() {
 		remote = node
 	}
 
-	local, err := chord.NewLocalNode(rand.Uint64(), *addr, remote)
+	local, err := chord.NewLocalNode(ctx, rand.Uint64(), *addr, remote)
 	if err != nil {
 		panic(err)
 	}
@@ -39,10 +39,6 @@ func main() {
 	dht, err := chord.NewDHTServer(local, &chord.MemoryStore{})
 	if err != nil {
 		panic(err)
-	}
-
-	if *join != "" {
-		go local.Join(ctx)
 	}
 
 	server := &http.Server{Addr: *addr, Handler: dht.HTTPServeMux()}

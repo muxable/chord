@@ -26,22 +26,24 @@ func NewDHTServer(node *LocalNode, store Store) (*DHTServer, error) {
 			log.Printf("error when constraining %v", err)
 		}
 	})
-	// make this node a replicant of the successor.
-	resp, err := http.Get(fmt.Sprintf("http://%s/store", node.successors[0].Host()))
-	if err != nil {
-		return nil, err
-	}
-	body, err := ioutil.ReadAll(resp.Body)
-	if err != nil {
-		return nil, err
-	}
-	var data map[uint64][]byte
-	if err := json.Unmarshal(body, &data); err != nil {
-		return nil, err
-	}
-	for key, value := range data {
-		if err := store.Set(key, value); err != nil {
+	if node.successors[0] != node {
+		// make this node a replicant of the successor.
+		resp, err := http.Get(fmt.Sprintf("http://%s/store", node.successors[0].Host()))
+		if err != nil {
 			return nil, err
+		}
+		body, err := ioutil.ReadAll(resp.Body)
+		if err != nil {
+			return nil, err
+		}
+		var data map[uint64][]byte
+		if err := json.Unmarshal(body, &data); err != nil {
+			return nil, err
+		}
+		for key, value := range data {
+			if err := store.Set(key, value); err != nil {
+				return nil, err
+			}
 		}
 	}
 	return &DHTServer{node: node, store: store}, nil

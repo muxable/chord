@@ -44,7 +44,7 @@ type LocalNode struct {
 
 var _ Node = (*LocalNode)(nil)
 
-func NewLocalNode(id uint64, host string, m Node) (*LocalNode, error) {
+func NewLocalNode(ctx context.Context, id uint64, host string, m Node) (*LocalNode, error) {
 	n := &LocalNode{id: id, host: host}
 	for i := 0; i < M; i++ {
 		n.finger[i] = n
@@ -68,6 +68,30 @@ func NewLocalNode(id uint64, host string, m Node) (*LocalNode, error) {
 			return nil, io.ErrShortWrite
 		}
 	}
+	go func() {
+		// start stabilization loops
+		stabilize := time.NewTicker(1 * time.Second)
+		fixFingers := time.NewTicker(100 * time.Millisecond)
+		defer stabilize.Stop()
+		defer fixFingers.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-stabilize.C:
+				if err := n.Stabilize(); err != nil {
+					for i := 0; i < R-1; i++ {
+						n.successors[i] = n.successors[i+1]
+					}
+				}
+			case t := <-fixFingers.C:
+				if err := n.FixFingers(t.Nanosecond()); err != nil {
+					// TODO: this error is likely transient, can we remove it?
+					log.Printf("got error %v", err)
+				}
+			}
+		}
+	}()
 	return n, nil
 }
 
@@ -223,31 +247,6 @@ func (n *LocalNode) String() string {
 		ss[i] = n.successors[i].Serialize()
 	}
 	return fmt.Sprintf("local[%s]\npredecessor: %s\nsuccessors: %s", n.Serialize(), ps, ss)
-}
-
-func (n *LocalNode) Join(ctx context.Context) {
-	// start stabilization loops
-	stabilize := time.NewTicker(1 * time.Second)
-	fixFingers := time.NewTicker(100 * time.Millisecond)
-	defer stabilize.Stop()
-	defer fixFingers.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-stabilize.C:
-			if err := n.Stabilize(); err != nil {
-				for i := 0; i < R-1; i++ {
-					n.successors[i] = n.successors[i+1]
-				}
-			}
-		case t := <-fixFingers.C:
-			if err := n.FixFingers(t.Nanosecond()); err != nil {
-				// TODO: this error is likely transient, can we remove it?
-				log.Printf("got error %v", err)
-			}
-		}
-	}
 }
 
 type RemoteNode struct {
