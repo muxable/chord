@@ -51,7 +51,7 @@ func main() {
 			case <-ctx.Done():
 				return
 			case <-time.After(1 * time.Second):
-				log.Printf("%v", local)
+				log.Printf("\n%v", dht)
 			}
 		}
 	}()

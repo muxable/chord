@@ -41,7 +41,7 @@ func NewDHTServer(node *LocalNode, store Store) (*DHTServer, error) {
 			return nil, err
 		}
 		for key, value := range data {
-			if err := store.Set(key, value); err != nil {
+			if err := store.Set(key, bytes.NewReader(value)); err != nil {
 				return nil, err
 			}
 		}
@@ -49,24 +49,37 @@ func NewDHTServer(node *LocalNode, store Store) (*DHTServer, error) {
 	return &DHTServer{node: node, store: store}, nil
 }
 
-func (s *DHTServer) Get(key uint64) ([]byte, error) {
+func (s *DHTServer) Get(key uint64) (io.Reader, error) {
 	node, err := s.node.FindSuccessor(key)
 	if err != nil {
 		return nil, err
+	}
+	if node.ID() == s.node.ID() {
+		return s.store.Get(key)
 	}
 	resp, err := http.Get(fmt.Sprintf("http://%s/store?key=%x", node.Host(), key))
 	if err != nil {
 		return nil, err
+	} else if resp.StatusCode != 200 {
+		return nil, io.ErrUnexpectedEOF
 	}
-	return io.ReadAll(resp.Body)
+	return resp.Body, nil
 }
 
-func (s *DHTServer) Set(key uint64, value []byte) error {
+func (s *DHTServer) Set(key uint64, value io.Reader) error {
 	node, err := s.node.FindSuccessor(key)
 	if err != nil {
 		return err
 	}
-	_, err = http.Post(fmt.Sprintf("http://%s/store?key=%x", node.Host(), key), "application/octet-stream", bytes.NewReader(value))
+	if node.ID() == s.node.ID() {
+		return s.store.Set(key, value)
+	}
+	resp, err := http.Post(fmt.Sprintf("http://%s/store?key=%x", node.Host(), key), "application/octet-stream", value)
+	if err != nil {
+		return err
+	} else if resp.StatusCode != 200 {
+		return io.ErrShortWrite
+	}
 	return err
 }
 
@@ -90,15 +103,18 @@ func (s *DHTServer) HTTPServeMux() *http.ServeMux {
 			} else {
 				intkey, err := strconv.ParseUint(key, 16, 64)
 				if err != nil {
+					log.Printf("error %v", err)
 					w.WriteHeader(500)
 					return
 				}
-				value, err := s.store.Get(intkey)
+				value, err := s.Get(intkey)
 				if err != nil {
+					log.Printf("error %v", err)
 					w.WriteHeader(500)
 					return
 				}
-				if _, err := w.Write(value); err != nil {
+				if _, err := io.Copy(w, value); err != nil {
+					log.Printf("error %v", err)
 					w.WriteHeader(500)
 					return
 				}
@@ -106,39 +122,47 @@ func (s *DHTServer) HTTPServeMux() *http.ServeMux {
 
 		case "POST":
 			key := req.URL.Query().Get("key")
-			body, err := io.ReadAll(req.Body)
-			if err != nil {
-				w.WriteHeader(400)
-				return
-			}
 			if key == "" {
+				body, err := io.ReadAll(req.Body)
+				if err != nil {
+					w.WriteHeader(400)
+					return
+				}
 				var data map[uint64][]byte
 				if err := json.Unmarshal(body, &data); err != nil {
 					w.WriteHeader(400)
 					return
 				}
 				for key, value := range data {
-					if err := s.store.Set(key, value); err != nil {
+					if err := s.store.Set(key, bytes.NewReader(value)); err != nil {
 						w.WriteHeader(500)
 						return
 					}
 				}
+				w.WriteHeader(200)
 			} else {
 				intkey, err := strconv.ParseUint(key, 16, 64)
 				if err != nil {
+					log.Printf("error %v", err)
 					w.WriteHeader(500)
 					return
 				}
-				if err := s.store.Set(intkey, body); err != nil {
+				if err := s.Set(intkey, req.Body); err != nil {
+					log.Printf("error %v", err)
 					w.WriteHeader(500)
 					return
 				}
+				w.WriteHeader(200)
 			}
 		default:
 			w.WriteHeader(400)
 		}
 	}))
 	return mux
+}
+
+func (s *DHTServer) String() string {
+	return fmt.Sprintf("--- dht ---\n%v\n--- store ---\n%v", s.node, s.store)
 }
 
 func (s *DHTServer) Close() error {

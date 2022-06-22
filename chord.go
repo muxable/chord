@@ -20,7 +20,7 @@ func between(n1, n2, n3 uint64) bool {
 	if n1 < n3 {
 		return n1 < n2 && n2 <= n3
 	}
-	return n1 < n2 || n2 <= n3
+	return n1 < n2 || n2 <= n3 || n1 == n3
 }
 
 type Node interface {
