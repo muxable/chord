@@ -138,22 +138,16 @@ func (n *LocalNode) Stabilize() error {
 	if err != nil {
 		return err
 	}
+	if between(n.ID(), x.ID(), n.successors[0].ID()) {
+		// discovered a new successor.
+		n.successors[0] = x
+	}
 	y, err := n.successors[0].Successors()
 	if err != nil {
 		return err
 	}
 	if copy(n.successors[1:], y[:(R-1)]) != R-1 {
 		return io.ErrShortWrite
-	}
-	if between(n.ID(), x.ID(), n.successors[0].ID()) {
-		z, err := x.Successors()
-		if err != nil {
-			return err
-		}
-		n.successors[0] = x
-		if copy(n.successors[1:], z[:(R-1)]) != R-1 {
-			return io.ErrShortWrite
-		}
 	}
 	return n.successors[0].Notify(n)
 }
